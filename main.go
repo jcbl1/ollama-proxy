@@ -550,7 +550,13 @@ func tagsHandler(c *gin.Context) {
 func versionHandler(c *gin.Context) {
 	configLock.RLock()
 	defer configLock.RUnlock()
+
+	version := config.OllamaVersion
+	if version == "" {
+		version = "unknown"
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"version": config.OllamaVersion,
+		"version": version,
 	})
 }
