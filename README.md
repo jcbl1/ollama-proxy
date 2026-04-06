@@ -30,11 +30,15 @@
 本代理复用 [Continue.dev](https://docs.continue.dev/reference/) 的配置规范，可直接使用现有Continue配置：
 
 ```yaml
+ollamaVersion: 0.18.2
 models:
   - name: Novita deepseek v3
     provider: novita
     model: deepseek/deepseek-v3-0324
     apiKey: sk_xxxxx
+    capabilites:
+      - completion
+      - thinking
   - name: Inference.net DeepSeek V3
     provider: openai
     apiBase: https://api.inference.net/v1
