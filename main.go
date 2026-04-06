@@ -112,6 +112,7 @@ func main() {
 	r.GET("/v1/models", listModels)
 	r.POST("/api/show", showHandler)
 	r.GET("/api/tags", tagsHandler)
+	r.GET("/api/version", versionHandler)
 
 	// 添加根路径处理程序以进行健康检查或基本信息显示
 	r.GET("/", func(c *gin.Context) {
@@ -542,4 +543,10 @@ func tagsHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+func versionHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"version": "0.18.2",
+	})
 }
