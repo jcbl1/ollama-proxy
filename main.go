@@ -68,15 +68,16 @@ var providerAPIBaseMap = map[string]string{
 }
 
 type ProviderConfig struct {
-	Name          string `yaml:"name"`
-	Provider      string `yaml:"provider"`
-	APIBase       string `yaml:"apiBase,omitempty"`
-	Model         string `yaml:"model"`
-	APIKey        string `yaml:"apiKey"`
-	SystemMessage string `yaml:"systemMessage"`
-	Modelfile     string `yaml:"modelfile,omitempty"`
-	Parameters    string `yaml:"parameters,omitempty"`
-	Template      string `yaml:"template,omitempty"`
+	Name          string   `yaml:"name"`
+	Provider      string   `yaml:"provider"`
+	APIBase       string   `yaml:"apiBase,omitempty"`
+	Model         string   `yaml:"model"`
+	APIKey        string   `yaml:"apiKey"`
+	SystemMessage string   `yaml:"systemMessage"`
+	Modelfile     string   `yaml:"modelfile,omitempty"`
+	Parameters    string   `yaml:"parameters,omitempty"`
+	Template      string   `yaml:"template,omitempty"`
+	Capabilities  []string `yaml:"capabilities,omitempty"`
 }
 
 var (
@@ -286,7 +287,7 @@ Assistant: {{ .Response }}`
 			"tokenizer.ggml.bos_token_id":            0,
 			"tokenizer.ggml.eos_token_id":            0,
 		},
-		"capabilities": []string{},
+		"capabilities": target.Capabilities,
 	}
 
 	c.JSON(http.StatusOK, response)
