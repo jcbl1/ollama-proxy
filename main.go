@@ -45,7 +45,8 @@ type OllamaTagsResponse struct {
 }
 
 type Config struct {
-	Models []ProviderConfig `yaml:"models"`
+	OllamaVersion string           `yaml:"ollamaVersion,omitempty"`
+	Models        []ProviderConfig `yaml:"models"`
 }
 
 type responseRecorder struct {
@@ -546,7 +547,9 @@ func tagsHandler(c *gin.Context) {
 }
 
 func versionHandler(c *gin.Context) {
+	configLock.RLock()
+	defer configLock.RUnlock()
 	c.JSON(http.StatusOK, gin.H{
-		"version": "0.18.2",
+		"version": config.OllamaVersion,
 	})
 }
