@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
@@ -160,33 +159,45 @@ func loadConfig() {
 }
 
 func startWatcher() {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatalf("Failed to create watcher: %v", err)
-	}
-
+	// 使用轮询方式检测配置文件变化
+	// 这种方式在容器环境和绑定挂载卷时更可靠
 	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
+		var lastModTime time.Time
+		var lastSize int64
+
+		// 获取初始状态
+		info, err := os.Stat(configPath)
+		if err == nil {
+			lastModTime = info.ModTime()
+			lastSize = info.Size()
+		}
+
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			info, err := os.Stat(configPath)
+			if err != nil {
+				if debugFlag {
+					log.Printf("[DEBUG] Failed to stat config file: %v", err)
 				}
-				if event.Has(fsnotify.Write) {
-					loadConfig()
+				continue
+			}
+
+			// 检查修改时间或大小是否变化
+			if info.ModTime() != lastModTime || info.Size() != lastSize {
+				if debugFlag {
+					log.Printf("[DEBUG] Config file changed: modTime=%v, size=%d -> %d",
+						info.ModTime(), lastSize, info.Size())
 				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Printf("Watcher error: %v", err)
+				lastModTime = info.ModTime()
+				lastSize = info.Size()
+				loadConfig()
 			}
 		}
 	}()
 
-	if err := watcher.Add(configPath); err != nil {
-		log.Fatalf("Failed to watch config file: %v", err)
-	}
+	log.Println("Config file polling watcher started")
 }
 
 func listModels(c *gin.Context) {
