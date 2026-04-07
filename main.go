@@ -78,6 +78,7 @@ type ProviderConfig struct {
 	Parameters    string   `yaml:"parameters,omitempty"`
 	Template      string   `yaml:"template,omitempty"`
 	Capabilities  []string `yaml:"capabilities,omitempty"`
+	ContextLength int      `yaml:"contextLength,omitempty"`
 }
 
 var (
@@ -272,6 +273,12 @@ User: {{ .Prompt }}
 Assistant: {{ .Response }}`
 	}
 
+	// 从配置中获取 context_length，如果未配置则使用默认值 128000
+	contextLength := target.ContextLength
+	if contextLength <= 0 {
+		contextLength = 128000
+	}
+
 	// 生成符合 Ollama /api/show 格式的响应
 	response := gin.H{
 		"license":    "", // 通常为空或需要从上游获取（如果可能）
@@ -291,7 +298,7 @@ Assistant: {{ .Response }}`
 			"general.name":                           target.Name,
 			"general.file_type":                      2,
 			"general.parameter_count":                0,
-			"llama.context_length":                   120000,
+			"llama.context_length":                   contextLength,
 			"llama.block_count":                      0,
 			"llama.embedding_length":                 0,
 			"llama.attention.head_count":             0,
