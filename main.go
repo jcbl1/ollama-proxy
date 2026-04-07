@@ -46,6 +46,7 @@ type OllamaTagsResponse struct {
 
 type Config struct {
 	OllamaVersion string           `yaml:"ollamaVersion,omitempty"`
+	ListenAddress string           `yaml:"listenAddress,omitempty"`
 	Models        []ProviderConfig `yaml:"models"`
 }
 
@@ -122,8 +123,14 @@ func main() {
 	})
 
 	go func() {
-		log.Printf("Starting server on http://127.0.0.1:11434")
-		if err := r.Run("127.0.0.1:11434"); err != nil && err != http.ErrServerClosed {
+		configLock.RLock()
+		listenAddr := config.ListenAddress
+		if listenAddr == "" {
+			listenAddr = "127.0.0.1:11434"
+		}
+		configLock.RUnlock()
+		log.Printf("Starting server on http://%s", listenAddr)
+		if err := r.Run(listenAddr); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
