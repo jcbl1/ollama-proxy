@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -44,9 +45,15 @@ type OllamaTagsResponse struct {
 }
 
 type Config struct {
-	OllamaVersion string           `yaml:"ollamaVersion,omitempty"`
-	ListenAddress string           `yaml:"listenAddress,omitempty"`
-	Models        []ProviderConfig `yaml:"models"`
+	ProxyOptions ProxyOptions     `yaml:"proxyOptions,omitempty"`
+	Models       []ProviderConfig `yaml:"models"`
+}
+
+type ProxyOptions struct {
+	OllamaVersion        string `yaml:"ollamaVersion,omitempty"`
+	ListenAddress        string `yaml:"listenAddress,omitempty"`
+	ForceUpstreamStream  *bool  `yaml:"forceUpstreamStream,omitempty"`
+	AggregateToNonStream *bool  `yaml:"aggregateToNonStream,omitempty"`
 }
 
 type responseRecorder struct {
@@ -124,7 +131,7 @@ func main() {
 
 	go func() {
 		configLock.RLock()
-		listenAddr := config.ListenAddress
+		listenAddr := config.ProxyOptions.ListenAddress
 		if listenAddr == "" {
 			listenAddr = "127.0.0.1:11434"
 		}
@@ -327,39 +334,36 @@ func proxyHandler(c *gin.Context) {
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBodyBytes))
 	}
 
-	var openaiReq struct {
-		Model string `json:"model"` // 客户端请求中的模型名称 (对应配置中的 name)
-		// ... 其他可能的 OpenAI 请求字段
-	}
-	// 使用原始请求体进行解析
-	if err := json.Unmarshal(requestBodyBytes, &openaiReq); err != nil {
-		// 如果解析失败，可能不是 JSON 请求或格式不符，但仍可能需要代理（例如流式请求）
-		// 暂时记录错误，但继续尝试代理，让后端处理错误
+	var requestMap map[string]interface{}
+	var clientModelName string
+	clientWantsStream := false
+	if err := json.Unmarshal(requestBodyBytes, &requestMap); err != nil {
+		// 如果解析失败，可能不是 JSON 请求或格式不符，但仍可能需要代理（例如某些特殊请求）
 		log.Printf("[WARN] Failed to parse incoming request body for model extraction: %v", err)
-		// 对于无法解析 model 的情况，需要决定如何处理。
-		// 选项1：返回错误
-		// c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body, cannot determine model"})
-		// return
-		// 选项2：尝试使用默认模型或第一个模型（如果适用）
-		// 选项3：继续代理，让后端处理（当前选择）
+	} else {
+		clientModelName, _ = requestMap["model"].(string)
+		if streamValue, ok := requestMap["stream"].(bool); ok {
+			clientWantsStream = streamValue
+		}
 	}
 
 	configLock.RLock()
 	var target *ProviderConfig
 	// 根据客户端请求的 model (即配置中的 name) 查找目标配置
-	if openaiReq.Model != "" {
+	if clientModelName != "" {
 		for i := range config.Models {
-			if config.Models[i].Name == openaiReq.Model {
+			if config.Models[i].Name == clientModelName {
 				target = &config.Models[i]
 				break
 			}
 		}
 	}
+	options := config.ProxyOptions.withDefaults()
 	configLock.RUnlock() // 尽早释放读锁
 
 	if target == nil {
 		// 如果请求体中没有 model 或找不到匹配的模型
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found in proxy configuration", openaiReq.Model)})
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found in proxy configuration", clientModelName)})
 		return
 	}
 
@@ -382,24 +386,18 @@ func proxyHandler(c *gin.Context) {
 		return
 	}
 
+	// 当客户端是非流式请求时：上游强制流式 + 本地聚合后返回一次性 JSON
+	if !clientWantsStream && options.ForceUpstreamStream && options.AggregateToNonStream {
+		handleNonStreamAggregation(c, target, targetURL, requestBodyBytes, clientModelName)
+		return
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
 	// Configure transport to use environment proxy settings
 	// This will automatically use HTTP_PROXY, HTTPS_PROXY, and NO_PROXY
-	proxy.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		// Copy other potentially important defaults from http.DefaultTransport
-		// to maintain similar connection behavior (timeouts, keep-alives, etc.)
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
+
+	proxy.Transport = newProxyTransport()
 
 	// 记录原始请求 (如果 debug 开启)
 	if debugFlag {
@@ -431,54 +429,10 @@ func proxyHandler(c *gin.Context) {
 		// 可能需要移除或修改 Host 头，httputil 通常会处理好
 		req.Host = targetURL.Host
 
-		// 修改请求体：将 model 字段替换为目标服务商的模型 ID
-		bodyBytes, err := io.ReadAll(req.Body)
+		newBody, err := rewriteUpstreamRequestBody(req.Body, target, false)
 		if err != nil {
-			log.Printf("[ERROR] Failed to read request body in director: %v", err)
-			// 可能需要返回错误或允许请求继续（如果 body 不是必需的）
+			log.Printf("[ERROR] Failed to rewrite request body in director: %v", err)
 			return
-		}
-		req.Body.Close() // 关闭原始 body
-
-		var bodyMap map[string]interface{}
-		var newBody []byte
-		// 只有在 body 是有效的 JSON 时才尝试修改
-		if json.Unmarshal(bodyBytes, &bodyMap) == nil {
-			originalModel, _ := bodyMap["model"].(string) // 记录原始模型名称以供日志记录
-			bodyMap["model"] = target.Model               // 替换为目标模型 ID
-			// 可以在这里注入 system message (如果需要且请求格式支持)
-			// 例如，如果请求中有 messages 数组
-			/*
-				if messages, ok := bodyMap["messages"].([]interface{}); ok && target.SystemMessage != "" {
-					// 检查是否已存在 system message
-					hasSystem := false
-					for _, msg := range messages {
-						if m, ok := msg.(map[string]interface{}); ok && m["role"] == "system" {
-							hasSystem = true
-							break
-						}
-					}
-					// 如果没有 system message，则添加一个
-					if !hasSystem {
-						systemMsg := map[string]interface{}{"role": "system", "content": target.SystemMessage}
-						bodyMap["messages"] = append([]interface{}{systemMsg}, messages...)
-					}
-				}
-			*/
-
-			newBody, err = json.Marshal(bodyMap)
-			if err != nil {
-				log.Printf("[ERROR] Failed to marshal modified request body: %v", err)
-				// 如果序列化失败，恢复原始 body
-				newBody = bodyBytes
-				// 恢复原始 model 名称，以防日志记录错误
-				if bodyMap != nil {
-					bodyMap["model"] = originalModel
-				}
-			}
-		} else {
-			// 如果 body 不是 JSON 或解析失败，按原样转发
-			newBody = bodyBytes
 		}
 
 		req.Body = io.NopCloser(bytes.NewBuffer(newBody))
@@ -535,6 +489,234 @@ func proxyHandler(c *gin.Context) {
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
+func (o ProxyOptions) withDefaults() struct {
+	ForceUpstreamStream  bool
+	AggregateToNonStream bool
+} {
+	// 默认开启：上游强制流式、下游聚合为非流式
+	res := struct {
+		ForceUpstreamStream  bool
+		AggregateToNonStream bool
+	}{
+		ForceUpstreamStream:  true,
+		AggregateToNonStream: true,
+	}
+
+	if o.ForceUpstreamStream != nil {
+		res.ForceUpstreamStream = *o.ForceUpstreamStream
+	}
+	if o.AggregateToNonStream != nil {
+		res.AggregateToNonStream = *o.AggregateToNonStream
+	}
+	return res
+}
+
+func newProxyTransport() *http.Transport {
+	return &http.Transport{
+		// 使用环境变量代理配置（HTTP_PROXY / HTTPS_PROXY / NO_PROXY）
+		// Copy other potentially important defaults from http.DefaultTransport
+		// to maintain similar connection behavior (timeouts, keep-alives, etc.)
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+func rewriteUpstreamRequestBody(body io.ReadCloser, target *ProviderConfig, forceStream bool) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	_ = body.Close()
+
+	var bodyMap map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &bodyMap); err != nil {
+		// 如果 body 不是 JSON 或解析失败，按原样转发
+		return bodyBytes, nil
+	}
+
+	// 将客户端 model 名称替换为上游真实模型 ID
+	bodyMap["model"] = target.Model
+	if forceStream {
+		// 在“非流式聚合模式”中，强制上游启用 stream=true 规避长连接静默超时
+		bodyMap["stream"] = true
+	}
+
+	newBody, err := json.Marshal(bodyMap)
+	if err != nil {
+		return bodyBytes, nil
+	}
+	return newBody, nil
+}
+
+type streamChoiceDelta struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type streamChoice struct {
+	Index        int               `json:"index"`
+	Delta        streamChoiceDelta `json:"delta"`
+	FinishReason *string           `json:"finish_reason"`
+}
+
+type streamChunk struct {
+	ID      string                 `json:"id"`
+	Object  string                 `json:"object"`
+	Created int64                  `json:"created"`
+	Model   string                 `json:"model"`
+	Choices []streamChoice         `json:"choices"`
+	Usage   map[string]interface{} `json:"usage"`
+}
+
+func handleNonStreamAggregation(c *gin.Context, target *ProviderConfig, targetURL *url.URL, originalBody []byte, clientModelName string) {
+	// 上游固定走 chat/completions
+	basePath := strings.TrimSuffix(targetURL.Path, "/")
+	upstreamURL := fmt.Sprintf("%s://%s%s/chat/completions", targetURL.Scheme, targetURL.Host, basePath)
+
+	reqBody := io.NopCloser(bytes.NewBuffer(originalBody))
+	rewrittenBody, err := rewriteUpstreamRequestBody(reqBody, target, true)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to rewrite request body", "details": err.Error()})
+		return
+	}
+
+	upReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, upstreamURL, bytes.NewBuffer(rewrittenBody))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to create upstream request", "details": err.Error()})
+		return
+	}
+	upReq.Header = c.Request.Header.Clone()
+	upReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", target.APIKey))
+	upReq.Header.Set("Content-Type", "application/json")
+	upReq.Header.Del("Content-Length")
+	upReq.Host = targetURL.Host
+
+	client := &http.Client{Transport: newProxyTransport()}
+	resp, err := client.Do(upReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "proxy error", "details": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// 非 2xx 时透传上游错误体，便于排障
+		errorBody, _ := io.ReadAll(resp.Body)
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), errorBody)
+		return
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 128*1024), 2*1024*1024)
+
+	var (
+		content      strings.Builder
+		chunkID      string
+		chunkModel   string
+		created      int64
+		finishReason string
+		usage        map[string]interface{}
+	)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			// SSE 中的注释行/空行直接跳过
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
+			// OpenAI 风格流式结束标记
+			break
+		}
+
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			// 容错：某些上游可能插入非 JSON 行，记录后继续
+			if debugFlag {
+				log.Printf("[DEBUG] Failed to parse stream chunk: %v, payload=%s", err, payload)
+			}
+			continue
+		}
+
+		if chunkID == "" && chunk.ID != "" {
+			chunkID = chunk.ID
+		}
+		if chunkModel == "" && chunk.Model != "" {
+			chunkModel = chunk.Model
+		}
+		if created == 0 && chunk.Created > 0 {
+			created = chunk.Created
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+		if len(chunk.Choices) > 0 {
+			content.WriteString(chunk.Choices[0].Delta.Content)
+			if chunk.Choices[0].FinishReason != nil && *chunk.Choices[0].FinishReason != "" {
+				finishReason = *chunk.Choices[0].FinishReason
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read upstream stream", "details": err.Error()})
+		return
+	}
+
+	if chunkID == "" {
+		chunkID = fmt.Sprintf("chatcmpl-proxy-%d", time.Now().UnixNano())
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	if chunkModel == "" {
+		chunkModel = target.Model
+	}
+
+	responseModel := clientModelName
+	if responseModel == "" {
+		responseModel = chunkModel
+	}
+
+	response := gin.H{
+		"id":      chunkID,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   responseModel,
+		"choices": []gin.H{
+			{
+				"index": 0,
+				// 对客户端保持非流式返回格式：message 而不是 delta
+				"message": gin.H{
+					"role":    "assistant",
+					"content": content.String(),
+				},
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	if usage != nil {
+		response["usage"] = usage
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
 // tagsHandler handles requests for GET /api/tags
 func tagsHandler(c *gin.Context) {
 	configLock.RLock()
@@ -576,7 +758,7 @@ func versionHandler(c *gin.Context) {
 	configLock.RLock()
 	defer configLock.RUnlock()
 
-	version := config.OllamaVersion
+	version := config.ProxyOptions.OllamaVersion
 	if version == "" {
 		version = "unknown"
 	}
