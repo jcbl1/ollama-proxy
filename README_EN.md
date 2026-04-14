@@ -9,6 +9,7 @@ A locally running Ollama-compatible proxy service supporting seamless integratio
 - 🔌 Multi-provider support: Integration with Novita/SiliconFlow/Groq/xAI and other major platforms
 - 🔄 Dynamic configuration: Reuses Continue.dev configuration standard with YAML hot reload
 - 🧩 Protocol adaptation: Full implementation of Ollama core API specifications
+- 🌊 Stream anti-timeout mode: Can force upstream streaming to reduce Cloudflare 524 idle timeout risk
 - 🔍 Debug mode: Detailed request/response logging
 
 ## Use Cases
@@ -30,8 +31,11 @@ A locally running Ollama-compatible proxy service supporting seamless integratio
 This proxy reuses the [Continue.dev](https://docs.continue.dev/reference/) configuration standard and can directly use existing Continue configurations:
 
 ```yaml
-ollamaVersion: 0.18.2
-listenAddress: "127.0.0.1:11434"  # Optional, defaults to "127.0.0.1:11434", set to "0.0.0.0:11434" when using a container
+proxyOptions:
+  ollamaVersion: 0.18.2
+  listenAddress: "127.0.0.1:11434"  # Optional, defaults to "127.0.0.1:11434", set to "0.0.0.0:11434" when using a container
+  forceUpstreamStream: true         # Optional, default true. Force upstream stream=true for non-stream client requests
+  aggregateToNonStream: true        # Optional, default true. Aggregate upstream stream chunks before returning one JSON response
 models:
   - name: Novita deepseek v3
     provider: novita
@@ -50,6 +54,14 @@ models:
     model: deepseek-ai/DeepSeek-V3
     apiKey: sk-xxxxxx
 ```
+
+### Streaming Strategy
+
+- If client sends `stream: true`: request is proxied as a regular streaming response
+- If client sends non-stream request and both options are `true`:
+  - proxy forces upstream to return streaming chunks
+  - proxy aggregates chunks locally, then returns one non-stream JSON response
+- This mode is designed to reduce 524 errors caused by long idle upstream responses
 
 ## Development Guide
 

@@ -10,6 +10,7 @@
 - 🔌 多供应商支持：Novita/SiliconFlow/Groq/xAI等主流平台接入
 - 🔄 动态配置：复用Continue.dev配置规范，支持YAML热重载
 - 🧩 协议适配：完整实现Ollama核心API接口规范
+- 🌊 流式抗超时：上游可强制流式，缓解 Cloudflare 524 长时间静默超时
 - 🔍 调试模式：详细请求/响应日志追踪
 
 ## 使用场景
@@ -31,8 +32,11 @@
 本代理复用 [Continue.dev](https://docs.continue.dev/reference/) 的配置规范，可直接使用现有Continue配置：
 
 ```yaml
-ollamaVersion: 0.18.2
-listenAddress: "127.0.0.1:11434"  # 可选，默认为 "127.0.0.1:11434"，若需要在容器中运行，这里设置为0.0.0.0:11434
+proxyOptions:
+  ollamaVersion: 0.18.2
+  listenAddress: "127.0.0.1:11434"  # 可选，默认为 "127.0.0.1:11434"，若需要在容器中运行，这里设置为0.0.0.0:11434
+  forceUpstreamStream: true         # 可选，默认 true。客户端非流式请求时，强制上游 stream=true
+  aggregateToNonStream: true        # 可选，默认 true。将上游流式结果聚合后再返回给非流式客户端
 models:
   - name: Novita deepseek v3
     provider: novita
@@ -51,6 +55,14 @@ models:
     model: deepseek-ai/DeepSeek-V3
     apiKey: sk-xxxxxx
 ```
+
+### 流式策略说明
+
+- 当客户端请求 `stream: true`：按普通流式代理转发
+- 当客户端请求非流式且上述两个开关都为 `true`：
+  - 代理会强制上游使用流式返回
+  - 代理在本地聚合完整内容后，以单次 JSON（非流式）回给客户端
+- 该模式主要用于减少上游长时间无输出导致的 524 超时风险
 
 ## 开发指南
 
